@@ -21,6 +21,7 @@ package DIMEX
 
 import (
 	PP2PLink "SD/PP2PLink"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -60,6 +61,7 @@ type DIMEX_Module struct {
 	nbrResps  int
 	dbg       bool
 	ReqSnap   chan int               // app pede pra iniciar snapshtot de id X
+	SnapDone  chan int               // módulo informa snapshots locais concluídos
 	snaps     map[int]*SnapshotState // snapshots em andamento
 	recSnaps  *os.File               // arquivo snap_p<id>.txt
 
@@ -99,6 +101,7 @@ func NewDIMEX(_addresses []string, _id int, _dbg bool) *DIMEX_Module {
 		Req:      make(chan dmxReq, 1),
 		Ind:      make(chan dmxResp, 1),
 		ReqSnap:  make(chan int, 1),
+		SnapDone: make(chan int, 512),
 		snaps:    make(map[int]*SnapshotState),
 		recSnaps: arq,
 
@@ -139,16 +142,40 @@ func (module *DIMEX_Module) Start() {
 					module.handleUponReqExit() // ENTRADA DO ALGORITMO
 				}
 
+			case snapId := <-module.ReqSnap:
+				module.iniciaSnapshot(snapId)
+
 			case msgOutro := <-module.Pp2plink.Ind: // vindo de outro processo
-				//fmt.Printf("dimex recebe da rede: ", msgOutro)
-				if strings.Contains(msgOutro.Message, "respOK") {
+				tokens := strings.Split(msgOutro.Message, "|")
+				if len(tokens) < 3 {
+					module.outDbg("mensagem ignorada: formato inválido")
+					continue
+				}
+				switch tokens[1] {
+				case "snap":
+					if len(tokens) >= 4 {
+						snapId, errId := strconv.Atoi(tokens[2])
+						sender, errSender := strconv.Atoi(tokens[3])
+						if errId == nil && errSender == nil {
+							module.handleMarker(snapId, sender)
+						}
+					}
+				case "respOK":
+					sender, err := strconv.Atoi(tokens[2])
+					if err != nil {
+						continue
+					}
+					module.registraMensagemCanal(sender, msgOutro.Message)
 					module.outDbg("         <<<---- responde! " + msgOutro.Message)
 					module.handleUponDeliverRespOk(msgOutro) // ENTRADA DO ALGORITMO
-
-				} else if strings.Contains(msgOutro.Message, "reqEntry") {
+				case "reqEntry":
+					sender, err := strconv.Atoi(tokens[2])
+					if err != nil {
+						continue
+					}
+					module.registraMensagemCanal(sender, msgOutro.Message)
 					module.outDbg("          <<<---- pede??  " + msgOutro.Message)
 					module.handleUponDeliverReqEntry(msgOutro) // ENTRADA DO ALGORITMO
-
 				}
 			}
 		}
@@ -214,10 +241,13 @@ func (module *DIMEX_Module) handleUponDeliverReqEntry(msgOutro PP2PLink.PP2PLink
 
 	// se é minha prioridade (estou na SC ou quero entrar e meu pedido é mais antigo), então não respondo OK
 	myPriority := module.st == inMX || (module.st == wantMX && before(module.id, module.reqTs, reqId, reqTs))
+	if os.Getenv("DIMEX_FAULT") == "grant-all" {
+		myPriority = false
+	}
 
 	if myPriority {
 		module.waiting[reqId] = true
-	} else {
+	} else if os.Getenv("DIMEX_FAULT") != "never-reply" {
 		module.sendToLink(module.addresses[reqId], "|respOK|"+strconv.Itoa(module.id)+"|", module.addresses[module.id])
 	}
 	if module.lcl < reqTs {
@@ -288,6 +318,65 @@ func (module *DIMEX_Module) enviaMarcadores(snapId int) {
 				strconv.Itoa(module.id)+"|", module.addresses[module.id])
 		}
 	}
+}
+
+// iniciaSnapshot grava o estado local antes de enviar os markers, como exige
+// Chandy-Lamport. O laço único do módulo torna a captura atômica em relação
+// ao tratamento de pedidos e mensagens recebidas.
+func (module *DIMEX_Module) iniciaSnapshot(snapId int) {
+	if _, exists := module.snaps[snapId]; exists {
+		return
+	}
+	module.outDbg(fmt.Sprintf("inicia snapshot %d", snapId))
+	module.gravaEstado(snapId)
+	module.enviaMarcadores(snapId)
+	module.finalizaSeCompleto(snapId)
+}
+
+// handleMarker aplica as duas regras de Chandy-Lamport: o primeiro marker
+// inicia a captura local; markers posteriores fecham seus respectivos canais.
+func (module *DIMEX_Module) handleMarker(snapId, sender int) {
+	if sender < 0 || sender >= len(module.addresses) || sender == module.id {
+		return
+	}
+	snap, exists := module.snaps[snapId]
+	if !exists {
+		snap = module.gravaEstado(snapId)
+		module.enviaMarcadores(snapId)
+	}
+	if !snap.canalFechado[sender] {
+		snap.canalFechado[sender] = true
+		snap.faltam--
+	}
+	module.finalizaSeCompleto(snapId)
+}
+
+// Mensagens DiMeX recebidas depois da captura local e antes do marker daquele
+// remetente pertencem ao estado em trânsito do canal remetente -> este processo.
+func (module *DIMEX_Module) registraMensagemCanal(sender int, message string) {
+	if sender < 0 || sender >= len(module.addresses) || sender == module.id {
+		return
+	}
+	for _, snap := range module.snaps {
+		if !snap.canalFechado[sender] {
+			snap.Canais[sender] = append(snap.Canais[sender], message)
+		}
+	}
+}
+
+func (module *DIMEX_Module) finalizaSeCompleto(snapId int) {
+	snap, exists := module.snaps[snapId]
+	if !exists || snap.faltam != 0 {
+		return
+	}
+	if module.recSnaps != nil {
+		if err := json.NewEncoder(module.recSnaps).Encode(snap); err != nil {
+			fmt.Println("Erro gravando snapshot:", err)
+		}
+	}
+	delete(module.snaps, snapId)
+	module.SnapDone <- snapId
+	module.outDbg(fmt.Sprintf("snapshot %d completo", snapId))
 }
 
 func (module *DIMEX_Module) outDbg(s string) {

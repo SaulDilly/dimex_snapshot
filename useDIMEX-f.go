@@ -64,6 +64,33 @@ func main() {
 	// espera para facilitar inicializacao de todos processos (a mao)
 	time.Sleep(3 * time.Second)
 
+	// O processo 0 inicia snapshots enquanto o laço abaixo continua usando o
+	// DiMeX. O ticker regula apenas a frequência dos snapshots; não há pausa
+	// entre as duas escritas feitas dentro da seção crítica.
+	if id == 0 {
+		go func() {
+			const totalSnapshots = 300
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for snapId := 1; snapId <= totalSnapshots; snapId++ {
+				<-ticker.C
+				dmx.ReqSnap <- snapId
+			}
+			completed := make(map[int]bool, totalSnapshots)
+			count := 0
+			for count < totalSnapshots {
+				snapId := <-dmx.SnapDone
+				if snapId >= 1 && snapId <= totalSnapshots && !completed[snapId] {
+					completed[snapId] = true
+					count++
+					if count%25 == 0 || count == totalSnapshots {
+						fmt.Printf("[snapshot] %d/%d completos\n", count, totalSnapshots)
+					}
+				}
+			}
+		}()
+	}
+
 	for {
 		// SOLICITA ACESSO AO DIMEX
 		fmt.Println("[ APP id: ", id, " PEDE   MX ]")
