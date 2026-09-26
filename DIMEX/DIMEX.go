@@ -22,6 +22,7 @@ package DIMEX
 import (
 	PP2PLink "SD/PP2PLink"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -58,8 +59,27 @@ type DIMEX_Module struct {
 	reqTs     int          // timestamp local da ultima requisicao deste processo
 	nbrResps  int
 	dbg       bool
+	ReqSnap   chan int               // app pede pra iniciar snapshtot de id X
+	snaps     map[int]*SnapshotState // snapshots em andamento
+	recSnaps  *os.File               // arquivo snap_p<id>.txt
 
 	Pp2plink *PP2PLink.PP2PLink // acesso aa comunicacao enviar por PP2PLinq.Req  e receber por PP2PLinq.Ind
+}
+
+type SnapshotState struct {
+	// ---- vai para o arquivo (campos exportados = aparecem no JSON) ----
+	SnapId   int        `json:"snapId"`
+	PId      int        `json:"pid"`
+	St       State      `json:"st"`
+	Waiting  []bool     `json:"waiting"`
+	Lcl      int        `json:"lcl"`
+	ReqTs    int        `json:"reqTs"`
+	NbrResps int        `json:"nbrResps"`
+	Canais   [][]string `json:"canais"` // Canais[q] = msgs em trânsito no canal q -> este processo
+
+	// ---- controle interno (minúsculos = NÃO vão para o JSON) ----
+	canalFechado []bool // canalFechado[q] = já recebi o marcador de q
+	faltam       int    // quantos marcadores ainda faltam
 }
 
 // ------------------------------------------------------------------------------------
@@ -69,10 +89,18 @@ type DIMEX_Module struct {
 func NewDIMEX(_addresses []string, _id int, _dbg bool) *DIMEX_Module {
 
 	p2p := PP2PLink.NewPP2PLink(_addresses[_id], _dbg)
+	nomeArq := fmt.Sprintf("snap_p%d.txt", _id)
+	arq, err := os.OpenFile(nomeArq, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		fmt.Println("Erro abrindo arquivo de snapshot:", err)
+	}
 
 	dmx := &DIMEX_Module{
-		Req: make(chan dmxReq, 1),
-		Ind: make(chan dmxResp, 1),
+		Req:      make(chan dmxReq, 1),
+		Ind:      make(chan dmxResp, 1),
+		ReqSnap:  make(chan int, 1),
+		snaps:    make(map[int]*SnapshotState),
+		recSnaps: arq,
 
 		addresses: _addresses,
 		id:        _id,
@@ -216,6 +244,49 @@ func before(oneId, oneTs, othId, othTs int) bool {
 		return false
 	} else {
 		return oneId < othId
+	}
+}
+
+// tira a "foto" do estado local deste processo para o snapshot snapId
+func (module *DIMEX_Module) gravaEstado(snapId int) *SnapshotState {
+	n := len(module.addresses)
+
+	snap := &SnapshotState{
+		SnapId:   snapId,
+		PId:      module.id,
+		St:       module.st,
+		Lcl:      module.lcl,
+		ReqTs:    module.reqTs,
+		NbrResps: module.nbrResps,
+	}
+
+	// waiting é slice: precisa de CÓPIA, senão a foto muda junto com o módulo
+	snap.Waiting = make([]bool, n)
+	copy(snap.Waiting, module.waiting)
+
+	snap.Canais = make([][]string, n)
+	for i := 0; i < len(snap.Canais); i++ {
+		snap.Canais[i] = []string{}
+	}
+
+	snap.canalFechado = make([]bool, n)
+	snap.canalFechado[module.id] = true
+
+	snap.faltam = n - 1
+
+	module.snaps[snapId] = snap // registra como "em andamento"
+	return snap
+}
+
+// envia o marcador do snapshot snapId para todos os outros processos
+func (module *DIMEX_Module) enviaMarcadores(snapId int) {
+
+	for i := 0; i < len(module.addresses); i++ {
+		if i != module.id {
+			module.sendToLink(module.addresses[i], "|snap|"+
+				strconv.Itoa(snapId)+"|"+
+				strconv.Itoa(module.id)+"|", module.addresses[module.id])
+		}
 	}
 }
 
