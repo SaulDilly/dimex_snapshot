@@ -203,8 +203,6 @@ func (module *DIMEX_Module) handleUponReqEntry() {
 }
 
 func (module *DIMEX_Module) handleUponReqExit() {
-	fmt.Println("REQ EXIT")
-
 	module.waiting[module.id] = false
 	module.lcl++
 	for i := 0; i < len(module.waiting); i++ {

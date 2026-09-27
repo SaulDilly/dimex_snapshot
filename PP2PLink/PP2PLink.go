@@ -29,6 +29,7 @@ import (
 )
 
 const maxFrameSize = 4 * 1024 * 1024
+const linkQueueCapacity = 4096
 
 type PP2PLink_Req_Message struct {
 	To      string
@@ -66,13 +67,11 @@ type wireMessage struct {
 func NewPP2PLink(address string, debug bool) *PP2PLink {
 	epoch, err := newEpoch()
 	if err != nil {
-		// A unique process incarnation is needed to distinguish messages after
-		// a restart. Failing fast is safer than silently reusing message IDs.
 		panic(fmt.Sprintf("cannot create PP2PLink epoch: %v", err))
 	}
 	p2p := &PP2PLink{
-		Req:     make(chan PP2PLink_Req_Message, 1),
-		Ind:     make(chan PP2PLink_Ind_Message, 1),
+		Req:     make(chan PP2PLink_Req_Message, linkQueueCapacity),
+		Ind:     make(chan PP2PLink_Ind_Message, linkQueueCapacity),
 		Run:     true,
 		dbg:     debug,
 		Cache:   make(map[string]net.Conn),
@@ -103,7 +102,7 @@ func (module *PP2PLink) Start(address string) {
 	go func() {
 		listener, err := net.Listen("tcp4", address)
 		if err != nil {
-			module.outDbg("listen " + address + ": " + err.Error())
+			fmt.Printf("[PP2PLink] listen %s failed: %v\n", address, err)
 			return
 		}
 		for {
@@ -141,8 +140,6 @@ func (module *PP2PLink) receiveLoop(conn net.Conn) {
 		key := fmt.Sprintf("%s/%s", incoming.From, incoming.Epoch)
 		module.seenMu.Lock()
 		if incoming.Seq > module.seen[key] {
-			// Keep the ID reserved until the upper layer has accepted the message.
-			// This also serializes duplicate copies arriving on reconnects.
 			module.Ind <- PP2PLink_Ind_Message{From: incoming.From, Message: incoming.Payload}
 			module.seen[key] = incoming.Seq
 		}
@@ -158,6 +155,7 @@ func (module *PP2PLink) receiveLoop(conn net.Conn) {
 
 func (module *PP2PLink) Send(message PP2PLink_Req_Message) {
 	module.seq++
+	attempts := 0
 	wire := wireMessage{
 		Kind:    "data",
 		From:    module.address,
@@ -167,12 +165,13 @@ func (module *PP2PLink) Send(message PP2PLink_Req_Message) {
 	}
 
 	for {
+		attempts++
 		conn := module.Cache[message.To]
 		if conn == nil {
 			var err error
 			conn, err = net.DialTimeout("tcp", message.To, time.Second)
 			if err != nil {
-				module.outDbg("dial " + message.To + ": " + err.Error())
+				module.logRetry(attempts, message.To, err)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -191,10 +190,16 @@ func (module *PP2PLink) Send(message PP2PLink_Req_Message) {
 		if err == nil {
 			err = fmt.Errorf("unexpected acknowledgement")
 		}
-		module.outDbg("retry to " + message.To + ": " + err.Error())
+		module.logRetry(attempts, message.To, err)
 		_ = conn.Close()
 		delete(module.Cache, message.To)
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (module *PP2PLink) logRetry(attempt int, destination string, err error) {
+	if module.dbg || attempt == 1 || attempt%20 == 0 {
+		fmt.Printf("[PP2PLink] retry #%d to %s: %v\n", attempt, destination, err)
 	}
 }
 
