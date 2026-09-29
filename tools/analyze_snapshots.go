@@ -15,6 +15,7 @@ import (
 )
 
 type snapshot struct {
+	// Estes campos refletem o estado salvo por um processo no snapshot.
 	SnapID   int        `json:"snapId"`
 	PID      int        `json:"pid"`
 	St       int        `json:"st"`
@@ -26,17 +27,21 @@ type snapshot struct {
 }
 
 func main() {
+	// Lê as opções recebidas no comando e usa valores padrão quando faltam.
 	dir := flag.String("dir", ".", "diretório com snap_p<ID>.txt")
 	processes := flag.Int("processes", 3, "número de processos do sistema")
 	expected := flag.Int("expected", 300, "quantidade de IDs de snapshot esperada, começando em 1")
 	flag.Parse()
+	// Interrompe a análise se os parâmetros não fizerem sentido.
 	if *processes < 1 || *expected < 0 {
 		fmt.Fprintln(os.Stderr, "-processes deve ser pelo menos 1 e -expected não pode ser negativo")
 		os.Exit(2)
 	}
 
+	// Agrupa os registros por ID do snapshot e por ID do processo.
 	groups := make(map[int]map[int]snapshot)
 	for pid := 0; pid < *processes; pid++ {
+		// Cada processo grava seus registros em um arquivo próprio.
 		path := filepath.Join(*dir, fmt.Sprintf("snap_p%d.txt", pid))
 		file, err := os.Open(path)
 		if err != nil {
@@ -48,6 +53,7 @@ func main() {
 		line := 0
 		for scanner.Scan() {
 			line++
+			// Converte cada linha JSON em um registro de snapshot.
 			var s snapshot
 			if err := json.Unmarshal(scanner.Bytes(), &s); err != nil {
 				fmt.Fprintf(os.Stderr, "%s:%d: JSON inválido: %v\n", path, line, err)
@@ -60,6 +66,7 @@ func main() {
 			if groups[s.SnapID] == nil {
 				groups[s.SnapID] = make(map[int]snapshot)
 			}
+			// Um processo deve aparecer no máximo uma vez por snapshot.
 			if _, duplicate := groups[s.SnapID][pid]; duplicate {
 				fmt.Fprintf(os.Stderr, "snapshot %d tem registro duplicado para P%d\n", s.SnapID, pid)
 				os.Exit(2)
@@ -74,11 +81,13 @@ func main() {
 	}
 
 	ids := make([]int, 0, len(groups))
+	// Ordena os IDs para mostrar os resultados em sequência.
 	for id := range groups {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids)
 	violations := 0
+	// Confere se todos os IDs esperados aparecem nos arquivos.
 	for id := 1; id <= *expected; id++ {
 		if _, exists := groups[id]; !exists {
 			fmt.Printf("snapshot %d: ausente/incompleto (nenhum registro final em todos os processos)\n", id)
@@ -90,6 +99,7 @@ func main() {
 	}
 	for _, id := range ids {
 		states := groups[id]
+		// Só é possível verificar invariantes quando todos os processos registraram o snapshot.
 		if len(states) != *processes {
 			fmt.Printf("snapshot %d: incompleto (%d/%d processos)\n", id, len(states), *processes)
 			violations++
@@ -98,6 +108,7 @@ func main() {
 		var issues []string
 		inMXCount := 0
 		allNoMX := true
+		// Valida os estados e conta quantos processos estão na seção crítica.
 		for pid := 0; pid < *processes; pid++ {
 			s := states[pid]
 			if s.St < 0 || s.St > 2 || len(s.Waiting) != *processes || len(s.Channels) != *processes {
@@ -111,10 +122,12 @@ func main() {
 				allNoMX = false
 			}
 		}
+		// Inv1: no máximo um processo pode estar na seção crítica.
 		if inMXCount > 1 {
 			issues = append(issues, fmt.Sprintf("Inv1 mutex violado: %d processos em inMX", inMXCount))
 		}
 
+		// Inv3: um processo fora da seção crítica não deve guardar respostas adiadas.
 		for owner := 0; owner < *processes; owner++ {
 			s := states[owner]
 			if len(s.Waiting) != *processes {
@@ -127,6 +140,7 @@ func main() {
 			}
 		}
 
+		// Inv2: se ninguém está na seção crítica, não pode haver espera ou mensagem pendente.
 		if allNoMX {
 			for pid := 0; pid < *processes; pid++ {
 				s := states[pid]
@@ -143,8 +157,8 @@ func main() {
 			}
 		}
 
-		// Para um processo em wantMX, cada peer deve estar representado por
-		// resposta já recebida, pedido em trânsito, resposta adiada ou resposta em trânsito.
+		// Inv4: contabiliza como cada processo responde a quem ainda quer entrar.
+		// A resposta pode já ter chegado, estar adiada ou estar em trânsito; o pedido também pode estar em trânsito.
 		for requester := 0; requester < *processes; requester++ {
 			r := states[requester]
 			if r.St != 1 || len(r.Waiting) != *processes || len(r.Channels) != *processes {
@@ -179,6 +193,7 @@ func main() {
 			}
 		}
 	}
+	// Retorna erro ao terminal quando alguma violação foi encontrada.
 	fmt.Printf("Resumo: %d snapshots, %d problema(s) reportado(s)\n", len(ids), violations)
 	if violations > 0 {
 		os.Exit(1)
@@ -186,6 +201,7 @@ func main() {
 }
 
 func countMessage(messages []string, kind string, sender int) int {
+	// Conta mensagens de um tipo e remetente específicos no canal registrado.
 	count := 0
 	for _, message := range messages {
 		parts := strings.Split(message, "|")
