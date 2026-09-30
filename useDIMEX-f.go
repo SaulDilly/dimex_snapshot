@@ -50,8 +50,8 @@ func main() {
 	addresses := os.Args[2:]
 	// fmt.Print("id: ", id, "   ") fmt.Println(addresses)
 
-	var dmx *DIMEX.DIMEX_Module = DIMEX.NewDIMEX(addresses, id, true)
-	fmt.Println(dmx)
+	const debug = false
+	dmx := DIMEX.NewDIMEX(addresses, id, debug)
 
 	// abre arquivo que TODOS processos devem poder usar
 	file, err := os.OpenFile("./mxOUT.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -64,9 +64,38 @@ func main() {
 	// espera para facilitar inicializacao de todos processos (a mao)
 	time.Sleep(3 * time.Second)
 
+	// O processo 0 inicia snapshots enquanto o laço abaixo continua usando o
+	// DiMeX. O ticker regula apenas a frequência dos snapshots; não há pausa
+	// entre as duas escritas feitas dentro da seção crítica.
+	if id == 0 {
+		go func() {
+			const totalSnapshots = 300
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for snapId := 1; snapId <= totalSnapshots; snapId++ {
+				<-ticker.C
+				dmx.ReqSnap <- snapId
+			}
+			completed := make(map[int]bool, totalSnapshots)
+			count := 0
+			for count < totalSnapshots {
+				snapId := <-dmx.SnapDone
+				if snapId >= 1 && snapId <= totalSnapshots && !completed[snapId] {
+					completed[snapId] = true
+					count++
+					if count%25 == 0 || count == totalSnapshots {
+						fmt.Printf("[snapshot] %d/%d completos\n", count, totalSnapshots)
+					}
+				}
+			}
+		}()
+	}
+
 	for {
 		// SOLICITA ACESSO AO DIMEX
-		fmt.Println("[ APP id: ", id, " PEDE   MX ]")
+		if debug {
+			fmt.Println("[ APP id: ", id, " PEDE   MX ]")
+		}
 		dmx.Req <- DIMEX.ENTER
 		//fmt.Println("[ APP id: ", id, " ESPERA MX ]")
 		// ESPERA LIBERACAO DO MODULO DIMEX
@@ -79,7 +108,9 @@ func main() {
 			return
 		}
 
-		fmt.Println("[ APP id: ", id, " *EM*   MX ]")
+		if debug {
+			fmt.Println("[ APP id: ", id, " *EM*   MX ]")
+		}
 
 		_, err = file.WriteString(".") // marca saida no arquivo
 		if err != nil {
@@ -89,6 +120,8 @@ func main() {
 
 		// AGORA VAI LIBERAR O ARQUIVO PARA OUTROS
 		dmx.Req <- DIMEX.EXIT //
-		fmt.Println("[ APP id: ", id, " FORA   MX ]")
+		if debug {
+			fmt.Println("[ APP id: ", id, " FORA   MX ]")
+		}
 	}
 }

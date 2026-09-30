@@ -17,11 +17,19 @@
 package PP2PLink
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
+	"sync"
+	"time"
 )
+
+const maxFrameSize = 4 * 1024 * 1024
+const linkQueueCapacity = 4096
 
 type PP2PLink_Req_Message struct {
 	To      string
@@ -38,117 +46,205 @@ type PP2PLink struct {
 	Req   chan PP2PLink_Req_Message
 	Run   bool
 	dbg   bool
-	Cache map[string]net.Conn // cache de conexoes - reaproveita conexao com destino ao inves de abrir outra
+	Cache map[string]net.Conn
+
+	address string
+	epoch   string
+	seq     uint64 // acessado somente pela goroutine de envio
+
+	seenMu sync.Mutex
+	seen   map[string]uint64 // maior sequência entregue por processo e época
 }
 
-func NewPP2PLink(_address string, _dbg bool) *PP2PLink {
+type wireMessage struct {
+	Kind    string `json:"kind"`
+	From    string `json:"from"`
+	Epoch   string `json:"epoch"`
+	Seq     uint64 `json:"seq"`
+	Payload string `json:"payload,omitempty"`
+}
+
+func NewPP2PLink(address string, debug bool) *PP2PLink {
+	epoch, err := newEpoch()
+	if err != nil {
+		panic(fmt.Sprintf("cannot create PP2PLink epoch: %v", err))
+	}
 	p2p := &PP2PLink{
-		Req:   make(chan PP2PLink_Req_Message, 1),
-		Ind:   make(chan PP2PLink_Ind_Message, 1),
-		Run:   true,
-		dbg:   _dbg,
-		Cache: make(map[string]net.Conn)}
-	p2p.outDbg(" Init PP2PLink!")
-	p2p.Start(_address)
+		Req:     make(chan PP2PLink_Req_Message, linkQueueCapacity),
+		Ind:     make(chan PP2PLink_Ind_Message, linkQueueCapacity),
+		Run:     true,
+		dbg:     debug,
+		Cache:   make(map[string]net.Conn),
+		address: address,
+		epoch:   epoch,
+		seen:    make(map[string]uint64),
+	}
+	p2p.Start(address)
+	p2p.outDbg("Init PP2PLink")
 	return p2p
 }
 
-func (module *PP2PLink) outDbg(s string) {
+func newEpoch() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
+func (module *PP2PLink) outDbg(message string) {
 	if module.dbg {
-		fmt.Println(". . . . . . . . . . . . . . . . . [ PP2PLink msg : " + s + " ]")
+		fmt.Println("[PP2PLink] " + message)
 	}
 }
 
 func (module *PP2PLink) Start(address string) {
-
-	// PROCESSO PARA RECEBIMENTO DE MENSAGENS
 	go func() {
-		listen, _ := net.Listen("tcp4", address)
+		listener, err := net.Listen("tcp4", address)
+		if err != nil {
+			fmt.Printf("[PP2PLink] listen %s failed: %v\n", address, err)
+			return
+		}
 		for {
-			// aceita repetidamente tentativas novas de conexao
-			conn, err := listen.Accept()
-			module.outDbg("ok   : conexao aceita com outro processo.")
-			// para cada conexao lanca rotina de tratamento
-			go func() {
-				// repetidamente recebe mensagens na conexao TCP (sem fechar)
-				// e passa para modulo de cima
-				for { //                              // enquanto conexao aberta
-					if err != nil {
-						fmt.Println(".", err)
-						break
-					}
-					bufTam := make([]byte, 4) //       // le tamanho da mensagem
-					_, err := io.ReadFull(conn, bufTam)
-					if err != nil {
-						module.outDbg("erro : " + err.Error() + " conexao fechada pelo outro processo.")
-						break
-					}
-					tam, err := strconv.Atoi(string(bufTam))
-					bufMsg := make([]byte, tam)        // declara buffer do tamanho exato
-					_, err = io.ReadFull(conn, bufMsg) // le do tamanho do buffer ou da erro
-					if err != nil {
-						fmt.Println("@", err)
-						break
-					}
-					msg := PP2PLink_Ind_Message{
-						From:    conn.RemoteAddr().String(),
-						Message: string(bufMsg)}
-					// ATE AQUI:  procedimentos para receber msg
-					module.Ind <- msg //               // repassa mensagem para modulo superior
-				}
-			}()
+			conn, err := listener.Accept()
+			if err != nil {
+				module.outDbg("accept: " + err.Error())
+				continue
+			}
+			go module.receiveLoop(conn)
 		}
 	}()
 
-	// PROCESSO PARA ENVIO DE MENSAGENS
 	go func() {
-		for {
-			message := <-module.Req
+		for message := range module.Req {
 			module.Send(message)
 		}
 	}()
 }
 
-func (module *PP2PLink) Send(message PP2PLink_Req_Message) {
-	var conn net.Conn
-	var ok bool
-	var err error
+func (module *PP2PLink) receiveLoop(conn net.Conn) {
+	defer conn.Close()
+	for {
+		var incoming wireMessage
+		if err := readFrame(conn, &incoming); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				module.outDbg("receive: " + err.Error())
+			}
+			return
+		}
+		if incoming.Kind != "data" || incoming.From == "" || incoming.Epoch == "" || incoming.Seq == 0 {
+			module.outDbg("invalid data frame")
+			return
+		}
 
-	// ja existe uma conexao aberta para aquele destinatario?
-	if conn, ok = module.Cache[message.To]; ok {
-	} else { // se nao existe, abre e guarda na cache
-		conn, err = net.Dial("tcp", message.To)
-		module.outDbg("ok   : conexao iniciada com outro processo")
-		if err != nil {
-			fmt.Println(err)
+		key := fmt.Sprintf("%s/%s", incoming.From, incoming.Epoch)
+		module.seenMu.Lock()
+		if incoming.Seq > module.seen[key] {
+			module.Ind <- PP2PLink_Ind_Message{From: incoming.From, Message: incoming.Payload}
+			module.seen[key] = incoming.Seq
+		}
+		module.seenMu.Unlock()
+
+		ack := wireMessage{Kind: "ack", From: module.address, Epoch: incoming.Epoch, Seq: incoming.Seq}
+		if err := writeFrame(conn, ack); err != nil {
+			module.outDbg("ack send: " + err.Error())
 			return
 		}
-		module.Cache[message.To] = conn
 	}
-	// calcula tamanho da mensagem e monta string de 4 caracteres numericos com o tamanho.
-	// completa com 0s aa esquerda para fechar tamanho se necessario.
-	str := strconv.Itoa(len(message.Message))
-	for len(str) < 4 {
-		str = "0" + str
+}
+
+func (module *PP2PLink) Send(message PP2PLink_Req_Message) {
+	module.seq++
+	attempts := 0
+	wire := wireMessage{
+		Kind:    "data",
+		From:    module.address,
+		Epoch:   module.epoch,
+		Seq:     module.seq,
+		Payload: message.Message,
 	}
-	if !(len(str) == 4) {
-		module.outDbg("ERROR AT PPLINK MESSAGE SIZE CALCULATION - INVALID MESSAGES MAY BE IN TRANSIT")
+
+	for {
+		attempts++
+		conn := module.Cache[message.To]
+		if conn == nil {
+			var err error
+			conn, err = net.DialTimeout("tcp", message.To, time.Second)
+			if err != nil {
+				module.logRetry(attempts, message.To, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			module.Cache[message.To] = conn
+		}
+
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		err := writeFrame(conn, wire)
+		if err == nil {
+			var ack wireMessage
+			if err = readFrame(conn, &ack); err == nil && ack.Kind == "ack" && ack.From == message.To && ack.Epoch == module.epoch && ack.Seq == wire.Seq {
+				_ = conn.SetDeadline(time.Time{})
+				return
+			}
+		}
+		if err == nil {
+			err = fmt.Errorf("unexpected acknowledgement")
+		}
+		module.logRetry(attempts, message.To, err)
+		_ = conn.Close()
+		delete(module.Cache, message.To)
+		time.Sleep(100 * time.Millisecond)
 	}
-	_, err = fmt.Fprintf(conn, str)             // escreve 4 caracteres com tamanho
-	_, err = fmt.Fprintf(conn, message.Message) // escreve a mensagem com o tamanho calculado
+}
+
+func (module *PP2PLink) logRetry(attempt int, destination string, err error) {
+	if module.dbg || attempt == 1 || attempt%20 == 0 {
+		fmt.Printf("[PP2PLink] retry #%d to %s: %v\n", attempt, destination, err)
+	}
+}
+
+func writeFrame(writer io.Writer, message wireMessage) error {
+	body, err := json.Marshal(message)
 	if err != nil {
-		module.outDbg("erro : " + err.Error() + ". Conexao fechada. 1 tentativa de reabrir:")
-		conn, err = net.Dial("tcp", message.To)
-		if err != nil {
-			//fmt.Println(err)
-			module.outDbg("       " + err.Error())
-			return
-		} else {
-			module.outDbg("ok   : conexao iniciada com outro processo.")
-		}
-		module.Cache[message.To] = conn
-		_, err = fmt.Fprintf(conn, str)             // escreve 4 caracteres com tamanho
-		_, err = fmt.Fprintf(conn, message.Message) // escreve a mensagem com o tamanho calculado
+		return err
 	}
-	return
+	if len(body) == 0 || len(body) > maxFrameSize {
+		return fmt.Errorf("invalid frame size %d", len(body))
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
+	if err := writeAll(writer, header[:]); err != nil {
+		return err
+	}
+	return writeAll(writer, body)
+}
+
+func readFrame(reader io.Reader, target *wireMessage) error {
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 || size > maxFrameSize {
+		return fmt.Errorf("invalid frame size %d", size)
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(reader, body); err != nil {
+		return err
+	}
+	return json.Unmarshal(body, target)
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
